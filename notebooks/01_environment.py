@@ -27,7 +27,7 @@ def _():
 @app.cell
 def _(mo, navigation):
     refresh = mo.ui.refresh(options=['5s','15s','1m'], default_interval=None, label='只讀檢查')
-    mo.sidebar(mo.vstack([navigation(mo), refresh]), width=290)
+    mo.sidebar(mo.vstack([navigation(mo, "01"), refresh]), width=290)
     return (refresh,)
 
 

@@ -45,7 +45,7 @@ def _(mo):
 
 @app.cell
 def _(mo, navigation, partition, refresh, run_filter):
-    mo.sidebar(mo.vstack([mo.md("## Slurm Learning Lab"), navigation(mo), partition, run_filter, refresh,
+    mo.sidebar(mo.vstack([mo.md("## Slurm Learning Lab"), navigation(mo, "00"), partition, run_filter, refresh,
         mo.md("**只讀 Dashboard**\n\n提交與維運請到實驗頁。關閉頁面不取消工作。")]), width=290)
     return
 

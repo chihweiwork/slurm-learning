@@ -1,4 +1,5 @@
 """Presentation shared by the twelve marimo notebooks; no external effects."""
+from html import escape
 from urllib.parse import quote
 
 CHAPTERS = [
@@ -17,8 +18,22 @@ CHAPTERS = [
 ]
 
 
-def navigation(mo):
-    return mo.nav_menu({'/': 'Gallery', **{'/?file=' + quote(name): title for name, title in CHAPTERS}}, orientation='vertical')
+def navigation(mo, current_chapter):
+    """Use native links: nav_menu rewrites Gallery query-string routes."""
+    links = ['<a href="/" target="_self">Gallery</a>']
+    for name, title in CHAPTERS:
+        current = name.startswith(current_chapter + '_')
+        attribute = ' aria-current="page"' if current else ''
+        label = escape(title) + (' <small>（目前頁面）</small>' if current else '')
+        links.append(f'<a href="/?file={quote(name)}" target="_self"{attribute}>{label}</a>')
+    return mo.Html(
+        '<style>.lab-navigation a {display:block;padding:0.45rem 0.6rem;'
+        'border-left:3px solid transparent;color:inherit;text-decoration:none;}'
+        '.lab-navigation a:hover {text-decoration:underline;}'
+        '.lab-navigation a[aria-current="page"] {border-left-color:currentColor;font-weight:700;}'
+        '</style><nav class="lab-navigation" aria-label="實驗頁面">'
+        + ''.join(links) + '</nav>'
+    )
 
 
 def json_view(mo, value):

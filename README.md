@@ -62,6 +62,9 @@ PYTHONPATH="$PWD/scripts" uv run --locked marimo run notebooks/ \
 ```
 
 開啟終端列出的帶 token loopback URL。Gallery 包含 Dashboard 與十一個實驗。
+側欄以粗體、左側標線與「目前頁面」標示所在章節；使用原生連結保留 Gallery 的
+`?file=...` 路由，切頁、重新整理與瀏覽器上一頁都會對應正確章節。
+更新共用 Python helpers 後，需重啟 marimo server 才會載入修正；只刷新網頁不會重載已匯入的模組。
 run 模式可以閱讀程式，但不能編輯。需要編輯時，先停止上述 server，再執行：
 
 ```bash

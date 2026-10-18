@@ -59,7 +59,7 @@ def setup_controls(mo, lesson):
 
     restore_menu = mo.ui.dropdown(choices, value='未選擇', label='恢復既有 run', full_width=True, on_change=restore)
     refresh = mo.ui.refresh(options=['5s', '15s', '1m'], default_interval=None, label='只讀刷新')
-    sidebar = mo.sidebar(mo.vstack([navigation(mo), restore_menu, refresh, mo.md('重新載入只讀取紀錄，不重送、不自動清理。')]), width=290)
+    sidebar = mo.sidebar(mo.vstack([navigation(mo, lesson['chapter'].split('-', 1)[0]), restore_menu, refresh, mo.md('重新載入只讀取紀錄，不重送、不自動清理。')]), width=290)
     return {'get_run': get_run, 'get_event': get_event, 'set_event': set_event, 'refresh': refresh,
             'view': mo.vstack([sidebar, form, create_button, mo.md('參數變更需要新 run。按鈕才會執行外部命令；關閉頁面不取消工作。')])}
 
