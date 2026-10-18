@@ -1,0 +1,8 @@
+.git
+.env
+shared
+runtime
+__pycache__
+*.pyc
+.venv/
+__marimo__/

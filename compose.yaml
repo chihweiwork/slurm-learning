@@ -1,0 +1,112 @@
+name: slurm-playground
+
+x-common: &common
+  image: slurm-playground/node:26.05.5
+  build:
+    context: .
+    dockerfile: docker/Dockerfile
+  working_dir: /shared
+  volumes:
+    - ./config/slurm.conf:/etc/slurm/slurm.conf:ro
+    - ./config/cgroup.conf:/etc/slurm/cgroup.conf:ro
+    - ./config/gres.conf:/etc/slurm/gres.conf:ro
+    - ./config/plugstack.conf:/etc/slurm/plugstack.conf:ro
+    - munge-key:/etc/munge:ro
+    - ./shared:/shared
+    - ./examples:/opt/lab/examples:ro
+  networks: [cluster]
+  pids_limit: 1024
+  stop_grace_period: 30s
+
+x-compute: &compute
+  <<: *common
+  command: [compute]
+  cgroup: private
+  cap_add: [SYS_ADMIN, BPF, SYS_RESOURCE, SYS_NICE]
+  security_opt:
+    - apparmor=unconfined
+    - seccomp=unconfined
+  environment:
+    container: docker
+  tmpfs:
+    - /run
+    - /run/lock
+  stop_signal: SIGRTMIN+3
+  ulimits:
+    memlock: {soft: -1, hard: -1}
+    nofile: {soft: 65536, hard: 65536}
+  healthcheck:
+    test: [CMD-SHELL, 'systemctl is-active --quiet munge slurmd']
+    interval: 5s
+    timeout: 3s
+    retries: 20
+    start_period: 15s
+
+services:
+  init:
+    image: slurm-playground/node:26.05.5
+    profiles: [setup]
+    command: [init]
+    volumes:
+      - munge-key:/etc/munge
+    network_mode: none
+
+  controller:
+    <<: *common
+    hostname: controller
+    command: [controller]
+    cpuset: '6-7,14-15'
+    cpus: 2
+    mem_limit: 2g
+    memswap_limit: 2g
+    volumes:
+      - ./config/slurm.conf:/etc/slurm/slurm.conf:ro
+      - ./config/plugstack.conf:/etc/slurm/plugstack.conf:ro
+      - munge-key:/etc/munge:ro
+      - ./shared:/shared
+      - ./examples:/opt/lab/examples:ro
+      - controller-state:/var/lib/slurm/ctld
+    healthcheck:
+      test: [CMD-SHELL, 'scontrol ping | grep -q "is UP"']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  cpu01:
+    <<: *compute
+    hostname: cpu01
+    cpuset: '0-1,8-9'
+    mem_limit: 8g
+    memswap_limit: 8g
+
+  cpu02:
+    <<: *compute
+    hostname: cpu02
+    cpuset: '2-3,10-11'
+    mem_limit: 8g
+    memswap_limit: 8g
+
+  gpu01:
+    <<: *compute
+    hostname: gpu01
+    cpuset: '4-5,12-13'
+    mem_limit: 16g
+    memswap_limit: 16g
+    environment:
+      container: docker
+      NVIDIA_VISIBLE_DEVICES: '0'
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu]
+
+networks:
+  cluster:
+
+volumes:
+  controller-state:
+  munge-key:

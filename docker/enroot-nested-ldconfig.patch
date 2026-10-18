@@ -1,0 +1,14 @@
+--- a/98-nvidia.sh
++++ b/98-nvidia.sh
+@@ -27,7 +27,10 @@
+     [ -v "${key}" ] || export "${key}=${value}"
+ done || :
+ 
+-cli_args=("--no-cgroups" "--ldconfig=@$(command -v ldconfig.real || command -v ldconfig)")
++# Nested Docker masks proc paths, so host-relative ldconfig's extra proc mount
++# is denied by the kernel. Use the image's loader in the existing confinement;
++# libnvidia-container still drops capabilities and applies its seccomp filter.
++cli_args=("--no-cgroups" "--ldconfig=/sbin/ldconfig")
+ 
+ # https://github.com/nvidia/nvidia-container-runtime#nvidia_visible_devices
+ if [ "${NVIDIA_VISIBLE_DEVICES:-void}" = "void" ]; then

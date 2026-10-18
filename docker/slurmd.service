@@ -1,0 +1,21 @@
+[Unit]
+Description=Slurm compute daemon
+After=munge.service network.target
+Requires=munge.service
+
+[Service]
+Type=simple
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+PassEnvironment=NVIDIA_VISIBLE_DEVICES NVIDIA_DRIVER_CAPABILITIES
+ExecStart=/usr/local/sbin/slurmd -D
+ExecReload=/bin/kill -HUP $MAINPID
+KillMode=process
+Delegate=yes
+LimitNOFILE=65536
+LimitMEMLOCK=infinity
+TasksMax=infinity
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
