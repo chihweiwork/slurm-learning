@@ -21,10 +21,26 @@ def setup_controls(mo, lesson):
     # Only button/form callbacks set this state; rerendering controls is read-only.
     get_event, set_event = mo.state(None, allow_self_loops=True)
     fields = lesson.get('fields') or {'practice': ['標準實驗']}
-    form = mo.md('\n\n'.join(f'**{name}** {{{name}}}' for name in fields)).batch(**{
+    submit_chapter = lesson['chapter'] == '02-submit'
+    single_setup = lesson['chapter'] in {'02-submit', '03-queue', '04-csv', '05-mpi'}
+    manual_observation = lesson['chapter'] in {'04-csv', '05-mpi'}
+
+    def create_with_parameters(value):
+        if value is None:
+            return
+        result = _call(lambda: lab.prepare_run(lesson['chapter'], value))
+        if result.get('run_id'):
+            set_run(result['run_id'])
+        set_event(result)
+
+    labels = {'node': '執行節點', 'cpus': '每個 task 申請的 CPU 數'} if submit_chapter else (
+        {'mode': '實驗路徑'} if lesson['chapter'] == '04-csv' else
+        {'practice': '實驗設定'} if lesson['chapter'] == '05-mpi' else {})
+    form = mo.md('\n\n'.join(f'**{labels.get(name, name)}** {{{name}}}' for name in fields)).batch(**{
         name: mo.ui.dropdown(values, value=values[0]) for name, values in fields.items()
-    }).form(submit_button_label='凍結參數（不提交工作）',
-            on_change=lambda value: set_event({'status': 'parameters-ready', 'parameters': value}))
+    }).form(submit_button_label='套用參數並建立實驗' if single_setup else '凍結參數（不提交工作）',
+            on_change=create_with_parameters if single_setup else
+            lambda value: set_event({'status': 'parameters-ready', 'parameters': value}))
 
     def create(_):
         if form.value is None:
@@ -36,7 +52,7 @@ def setup_controls(mo, lesson):
         set_event(result)
         return result
 
-    create_button = mo.ui.button(label='建立實驗', on_click=create)
+    create_buttons = [] if single_setup else [mo.ui.button(label='建立實驗', on_click=create)]
     choices = {'未選擇': ''}
     for entry in read_history():
         if entry.get('source') != 'demos' or not entry.get('run_id'):
@@ -59,21 +75,33 @@ def setup_controls(mo, lesson):
 
     restore_menu = mo.ui.dropdown(choices, value='未選擇', label='恢復既有 run', full_width=True, on_change=restore)
     refresh = mo.ui.refresh(options=['5s', '15s', '1m'], default_interval=None, label='只讀刷新')
-    sidebar = mo.sidebar(mo.vstack([navigation(mo, lesson['chapter'].split('-', 1)[0]), restore_menu, refresh, mo.md('重新載入只讀取紀錄，不重送、不自動清理。')]), width=290)
+    sidebar = mo.sidebar(mo.vstack([navigation(mo, lesson['chapter'].split('-', 1)[0]), restore_menu,
+        *([] if manual_observation else [refresh]),
+        mo.md('各段觀察按鈕只更新該段取樣。重新載入不重送、不自動清理。' if manual_observation else
+              '重新載入只讀取紀錄，不重送、不自動清理。')]), width=290)
     return {'get_run': get_run, 'get_event': get_event, 'set_event': set_event, 'refresh': refresh,
-            'view': mo.vstack([sidebar, form, create_button, mo.md('參數變更需要新 run。按鈕才會執行外部命令；關閉頁面不取消工作。')])}
+            'form': form, 'restore_menu': restore_menu,
+            'view': mo.vstack([sidebar, form, *create_buttons, mo.md(
+                '參數變更需要新 run。按鈕才會執行外部命令；關閉頁面不取消工作。')])}
 
 
-def action_controls(mo, lesson, run_id, set_event):
+def action_controls(mo, lesson, run_id, set_event, *, include_verification=True, buttons=None):
+    # The caller binds these UIElements to notebook globals. HTML alone is not
+    # a reliable owner/binding for marimo's weak UI-element registry.
     if not run_id:
-        return mo.md('先凍結參數並建立實驗，或在側欄恢復既有 run。')
+        return mo.md('先在上方建立實驗，或在側欄恢復既有 run。')
     try:
         run = lab.load_run(run_id)
         observed = lab.read_run(run_id)
     except (OSError, ValueError) as exc:
         return mo.md(str(exc)).callout(kind='danger')
     snapshot = None
-    panels = [mo.md(f'## 本次實驗 `{run_id}`'), json_view(mo, run['parameters'])]
+    submit_chapter = lesson['chapter'] == '02-submit'
+    if submit_chapter:
+        from submit_view import action_header, step_terminal
+        panels = [action_header(mo, run)]
+    else:
+        panels = [mo.md(f'## 本次實驗 `{run_id}`'), json_view(mo, run['parameters'])]
     for step_id, step in lesson['steps'].items():
         existing = next((r for r in observed['receipts'] if r['step_id'] == step_id), None)
         reason, argv = None, None
@@ -104,16 +132,33 @@ def action_controls(mo, lesson, run_id, set_event):
         title = lesson['labels'].get(step_id, step_id)
         button = mo.ui.button(label=title, on_click=invoke, disabled=bool(reason or existing),
                               kind='danger' if confirmation or step.effect == 'cancel' else 'neutral')
-        content = [mo.md(f'### {title} · `{step_id}`'),
-                   mo.md('```bash\n' + shlex.join(argv) + '\n```') if argv else mo.md('命令等待前置步驟的 job ID。')]
+        if buttons is not None:
+            buttons[step_id] = button
+        if submit_chapter:
+            content = [step_terminal(mo, step_id, title, argv, existing)]
+        else:
+            content = [mo.md(f'### {title} · `{step_id}`'),
+                       mo.md('```bash\n' + shlex.join(argv) + '\n```') if argv else mo.md('命令等待前置步驟的 job ID。')]
         if confirm:
             content.append(confirm)
         content.append(button)
         if existing:
-            content.append(mo.md(f"已消耗：**{existing['status']}** · job `{existing.get('job_id') or 'N/A'}`；重新載入不重送。"))
+            label = '已執行過，本次不再重送' if submit_chapter else '已消耗'
+            content.append(mo.md(f"{label}：**{existing['status']}** · job `{existing.get('job_id') or 'N/A'}`；重新載入不重送。"))
         elif reason:
             content.append(mo.md('尚不可執行：' + reason).callout(kind='warn'))
         panels.append(mo.vstack(content))
+
+    if include_verification:
+        panels.append(verification_controls(mo, lesson, run_id, set_event, buttons=buttons))
+    return mo.vstack(panels)
+
+
+def verification_controls(mo, lesson, run_id, set_event, *, buttons=None):
+    if not run_id:
+        return mo.md('')
+    submit_chapter = lesson['chapter'] == '02-submit'
+    panels = []
 
     def save(_):
         result = _call(lambda: lab.verify_run(run_id))
@@ -125,11 +170,22 @@ def action_controls(mo, lesson, run_id, set_event):
         set_event(result)
         return result
 
-    panels.append(mo.hstack([
-        mo.ui.button(label='驗證並保存', on_click=save, kind='success'),
-        mo.ui.button(label='只清理本次實驗', on_click=cleanup, kind='danger'),
-    ], wrap=True))
-    panels.append(mo.md('清理可重試，但不重放提交。unknown 請先人工核對唯一名稱、UID、工作目錄與時間；不自動收編。'))
+    if submit_chapter:
+        panels.extend([mo.Html('<span id="submit-verify"></span>'), mo.md('''### 驗證並保存，再清理
+        兩條路徑都執行後，先到[結果區](#submit-results)核對工作與輸出，再按「驗證並保存」。
+        它會檢查兩個工作是否 COMPLETED、退出碼是否成功，以及節點、UID、CPU affinity 和加總結果是否正確。
+        若工作還沒結束，報告可能仍是 running；稍後用側欄刷新，完成後再按一次驗證。
+        「只清理本次實驗」會取消本次仍未結束的工作，保留報告與輸出檔，不會取消別人的工作。
+        **關閉瀏覽器不會取消工作。**''')])
+    verify_button = mo.ui.button(label='驗證並保存', on_click=save, kind='success')
+    cleanup_button = mo.ui.button(label='只清理本次實驗', on_click=cleanup, kind='danger')
+    if buttons is not None:
+        buttons.update(verify=verify_button, cleanup=cleanup_button)
+    panels.append(mo.hstack([verify_button, cleanup_button], wrap=True))
+    panels.append(mo.md(
+        '清理失敗可以再按清理；已執行過的提交按鈕不會重送。若是 unknown，先核對完整紀錄中的工作名稱、使用者、目錄與時間；'
+        '確認並處理既有工作後，才建立新實驗。' if submit_chapter else
+        '清理可重試，但不重放提交。unknown 請先人工核對唯一名稱、UID、工作目錄與時間；不自動收編。'))
     return mo.vstack(panels)
 
 

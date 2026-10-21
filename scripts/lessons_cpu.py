@@ -69,6 +69,13 @@ def _release_ready(run, snapshot):
 
 
 def _queue_verify(data):
+    if receipt(data, 'cancel-holder'):
+        cancel = _done(data, 'cancel-holder')
+        evidence = cancel.get('evidence') or {}
+        require(evidence.get('holder') and evidence.get('pending'), '缺少取消 A 前的 RUNNING/PENDING 證據')
+        state(data, 'holder', 'CANCELLED')
+        return {'before_cancel': evidence, 'holder': records(data, 'holder'),
+                'waiter': _identity(data, 'waiter', 'cpu01', 1)}
     release = _done(data, 'release')
     evidence = release.get('evidence') or {}
     require(evidence.get('holder') and evidence.get('pending'), '缺少 release 前 RUNNING/PENDING 證據')
@@ -243,14 +250,14 @@ def get_lesson(chapter):
     elif chapter == '03-queue':
         steps = {
             'holder': lab.Step('submit', lambda r: submit(r, 'holder', command=probe('hold', '--release',
-                r['container_dir'] + '/queue.release', '--seconds', '180'),
-                options=('--nodelist=cpu01', '--cpus-per-task=4', '--exclusive', '--time=00:04:00'))),
-            'waiter': lab.Step('submit', lambda r: submit(r, 'waiter', script='cpu.sbatch',
+                r['container_dir'] + '/queue.release', '--seconds', '600'),
+                options=('--nodelist=cpu01', '--cpus-per-task=4', '--time=00:11:00'))),
+            'waiter': lab.Step('submit', lambda r: submit(r, 'waiter', command=probe('affinity') + '; sleep 60',
                 options=('--nodelist=cpu01',)), _queue_ready),
-            'release': lab.Step('local', lambda r: lab.local_argv(r['run_id'], 'release', 'queue.release'), _release_ready),
+            'cancel-holder': lab.Step('cancel', lambda r: compose_argv('scancel', job_id(r, 'holder')), _release_ready),
         }
-        lesson = dict(title='03 資源與排隊', fields={}, labels={'holder': '提交四 CPU holder（180 秒）',
-                      'waiter': '確認 holder 後提交 waiter', 'release': '保存 PENDING 證據並釋放 holder'},
+        lesson = dict(title='03 多個工作與資源排隊', fields={'實驗': ['A 佔用 cpu01 → B 排隊 → 取消 A']},
+                      labels={'holder': '啟動工作 A', 'waiter': '提交工作 B', 'cancel-holder': '取消工作 A，釋出資源'},
                       sources=['cpu.sbatch', 'cpu_probe.py'], cases=['resource-queue-release'],
                       verify=lambda d: [case('resource-queue-release', lambda: _queue_verify(d))])
     elif chapter == '04-csv':
@@ -283,5 +290,15 @@ def get_lesson(chapter):
     else:
         raise ValueError(f'Unknown CPU lesson: {chapter}')
     lesson.update(chapter=chapter, steps=steps)
-    lab.register_chapter(chapter, steps, verify=lesson['verify'])
+    registered_steps = dict(steps)
+    if chapter == '03-queue':
+        # Retain the old release action for existing saved runs, outside the new UI.
+        registered_steps['release'] = lab.Step('local', lambda r: lab.local_argv(
+            r['run_id'], 'release', 'queue.release'), _release_ready)
+    if chapter == '02-submit':
+        from submit_observer import observer_steps
+        from submit_serial import serial_steps
+        registered_steps.update(observer_steps())
+        registered_steps.update(serial_steps())
+    lab.register_chapter(chapter, registered_steps, verify=lesson['verify'])
     return lesson
