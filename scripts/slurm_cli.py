@@ -8,8 +8,9 @@ def run_command(argv: list[str], *, cwd: Path, timeout: float = 30) -> subproces
                           capture_output=True, timeout=timeout)
 
 
-def compose_argv(*args: str, user: str = "lab", service: str = "controller") -> list[str]:
-    return ["docker", "compose", "exec", "-T", "-u", user, service, *args]
+def compose_argv(*args: str, user: str = "lab", service: str = "controller", workdir: str | None = None) -> list[str]:
+    directory = ["-w", workdir] if workdir is not None else []
+    return ["docker", "compose", "exec", "-T", "-u", user, *directory, service, *args]
 
 
 def parse_job_id(stdout: str) -> str:

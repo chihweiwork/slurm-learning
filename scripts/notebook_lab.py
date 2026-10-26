@@ -29,6 +29,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from typing import Callable
 import uuid
@@ -46,7 +47,7 @@ from slurm_cli import compose_argv, parse_job_id, run_command
 ROOT = Path(__file__).resolve().parents[1]
 DEMOS = ROOT / "shared" / "demos"
 EFFECTS = frozenset({"submit", "interactive", "cancel", "drain", "resume",
-                     "restart-controller", "restore-controller", "local"})
+                     "restart-controller", "restore-controller", "local", "accounting"})
 TERMINAL = frozenset({"COMPLETED", "CANCELLED", "FAILED", "TIMEOUT", "OUT_OF_MEMORY",
                       "NODE_FAIL", "PREEMPTED", "BOOT_FAIL", "DEADLINE", "REVOKED"})
 _COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
@@ -228,6 +229,50 @@ def job_name(run_id: str, step_id: str) -> str:
     return name
 
 
+def account_name(run_id: str) -> str:
+    """The only Slurm account a run may create or delete (lowercase, run-unique)."""
+    _component(run_id)
+    return "demo-" + run_id.rsplit("-", 1)[-1][:12].lower()
+
+
+def account_marker(run_id: str) -> str:
+    """Description stamped on the run's account; Slurm stores it lowercased."""
+    return f"demo-{_component(run_id)}".lower()
+
+
+ACCOUNTING_OPERATIONS = ("add-account", "add-user", "delete-user", "delete-account")
+
+
+def accounting_argv(run_id: str, operation: str) -> list[str]:
+    """Fixed sacctmgr commands for the run-owned account and lab's association only."""
+    account = account_name(run_id)
+    commands = {
+        "add-account": ("add", "account", account, f"Description={account_marker(run_id)}", "Organization=lab"),
+        "add-user": ("add", "user", "lab", f"Account={account}"),
+        "delete-user": ("delete", "user", "lab", "where", f"Account={account}"),
+        "delete-account": ("delete", "account", account),
+    }
+    if operation not in commands:
+        raise ValueError(f"Unknown accounting operation: {operation}")
+    return compose_argv("sacctmgr", "-i", *commands[operation], user="root")
+
+
+def owned_account(run_id: str) -> dict:
+    """Read-only: does this run's account exist, and does its Description still prove ownership?"""
+    account = account_name(run_id)
+    result = run_command(compose_argv("sacctmgr", "--noheader", "--parsable2", "show", "account", account,
+                                      "format=Account,Description"), cwd=ROOT, timeout=15)
+    if result.returncode:
+        raise ValueError(f"sacctmgr query failed: {result.stderr.strip() or result.stdout.strip()}")
+    rows = [line.split("|") for line in result.stdout.splitlines() if line.strip()]
+    if not rows:
+        return {"account": account, "exists": False}
+    if len(rows) != 1 or rows[0][0] != account:
+        raise ValueError(f"Unexpected sacctmgr account rows: {rows}")
+    return {"account": account, "exists": True, "owned": rows[0][1] == account_marker(run_id),
+            "description": rows[0][1]}
+
+
 def local_argv(run_id: str, operation: str, *args: str) -> list[str]:
     """Build a real, bounded local command; paths are relative to this run.
 
@@ -310,6 +355,11 @@ def _validate_argv(run: dict, step_id: str, argv: list[str], effect: str, timeou
         raise ValueError(f"{effect} timeout may not exceed {maximum} seconds")
     if effect == "local":
         return _local_targets(run, argv)
+    if effect == "accounting":
+        for operation in ACCOUNTING_OPERATIONS:
+            if argv == accounting_argv(run["run_id"], operation):
+                return {"account": account_name(run["run_id"]), "operation": operation}
+        raise ValueError("accounting only permits the fixed sacctmgr commands for this run's own account")
     if effect == "restart-controller":
         if argv != ["docker", "compose", "restart", "controller"]:
             raise ValueError("restart-controller may only restart this project's controller")
@@ -414,6 +464,8 @@ def _records(run: dict) -> tuple[list[dict], list[dict], list[dict]]:
                 targets.get("node") != "cpu02" or targets.get("reason") != f"demo-{run['run_id']}"
             ):
                 raise ValueError("Invalid maintenance ownership in claim")
+            if claim["effect"] == "accounting" and targets.get("account") != account_name(run["run_id"]):
+                raise ValueError("Invalid accounting ownership in claim")
             claims.append(claim)
             receipt_path = path.with_suffix(".json")
             if receipt_path.exists() or receipt_path.is_symlink():
@@ -510,7 +562,7 @@ def _verify_identity(receipt: dict, jobs: list[dict], *, required: bool = True) 
 
 def _gate(run: dict, receipts: list[dict], effect: str, targets: dict, snapshot: dict) -> None:
     owned = _owned(receipts)
-    if effect == "local":
+    if effect in {"local", "accounting"}:
         return
     if effect == "restore-controller":
         restarts = [r for r in receipts if r["effect"] == "restart-controller"]
@@ -648,7 +700,7 @@ def execute_once(run_id: str, step_id: str, argv: list[str], *, effect: str, tim
                     raise ValueError("argv/effect differs from the fixed step built from frozen run parameters")
                 targets = _validate_argv(run, step_id, argv, effect, timeout)
                 _report(run)
-                names = () if effect == "local" else ("jobs",) if effect in {"cancel", "restore-controller"} else ("nodes",) if effect == "resume" else ("jobs", "nodes", "queue")
+                names = () if effect in {"local", "accounting"} else ("jobs",) if effect in {"cancel", "restore-controller"} else ("nodes",) if effect == "resume" else ("jobs", "nodes", "queue")
                 snapshot = _fresh(*names)
                 _gate(run, receipts, effect, targets, snapshot)
                 evidence = step.precondition(load_run(run_id), snapshot) if step.precondition else None
@@ -858,6 +910,85 @@ def verify_run(run_id: str) -> dict:
         return _blocked(str(exc))
 
 
+def _cleanup_account(run: dict, owned: dict, commands: list[dict]) -> None:
+    """Delete only this run's account (Description still proves ownership) after its jobs leave."""
+    deadline = time.monotonic() + 20
+    while owned:
+        queue = _data(_fresh("queue"), "queue")
+        active = {task.get("parent_job_id") or task.get("job_id", "").split("_", 1)[0] for task in queue}
+        if not active & set(owned):
+            break
+        if time.monotonic() > deadline:
+            raise ValueError("Owned jobs are still active; retry cleanup before deleting this run's account")
+        time.sleep(1)
+    current = owned_account(run["run_id"])
+    if not current["exists"]:
+        return
+    if not current["owned"]:
+        raise ValueError(f"Account {current['account']} Description is {current['description']!r}, not this run's marker; refusing to delete")
+    for operation in ("delete-user", "delete-account"):
+        command = {**_invoke(accounting_argv(run["run_id"], operation), 30),
+                   "kind": "cleanup", "effect": "accounting", "operation": operation}
+        commands.append(command)
+        if command["status"] != "succeeded" and "Nothing deleted" not in command["stdout"] + command["stderr"]:
+            raise ValueError(f"sacctmgr {operation}: {command.get('error') or command['stderr'] or command['stdout']}")
+
+
+def saved_receipts(run_id: str) -> list[dict]:
+    """This run's receipts only, without scheduler queries (for cross-run lookups)."""
+    return _records(load_run(run_id))[1]
+
+
+TIMELINE_INTERVAL = 0.2
+_TIMELINE_STATES = "COMPLETED|CANCELLED|FAILED|TIMEOUT|OUT_OF_MEMORY|NODE_FAIL|PREEMPTED|BOOT_FAIL|DEADLINE|GONE"
+
+
+def _timeline_path(run_id: str, step_id: str) -> Path:
+    directory = _run_path(run_id)
+    return _safe(directory, directory / f"timeline-{_component(step_id)}.json")
+
+
+def start_timeline(run_id: str, step_id: str, job_id: str, *, seconds: int = 600) -> None:
+    """Record one owned job's state transitions with timestamps (read-only, background).
+
+    A single `docker compose exec` runs a bounded squeue loop every TIMELINE_INTERVAL
+    seconds, so short states such as COMPLETING are caught that a 5 s page refresh misses.
+    """
+    if not _JOB_ID.fullmatch(job_id):
+        raise ValueError(f"Not a job ID: {job_id}")
+    directory, path = _run_path(run_id), _timeline_path(run_id, step_id)
+    script = (f'end=$((SECONDS+{int(seconds)})); last=; while [ $SECONDS -lt $end ]; do '
+              f's=$(squeue -h -t all -j {job_id} -o %T 2>/dev/null | head -n 1); s=${{s:-GONE}}; '
+              'if [ "$s" != "$last" ]; then echo "$(date +%s.%N) $s"; last=$s; fi; '
+              f'case "$s" in {_TIMELINE_STATES}) break;; esac; sleep {TIMELINE_INTERVAL}; done')
+    record = {"job_id": job_id, "interval": TIMELINE_INTERVAL, "samples": [], "done": False, "error": None}
+    _atomic_json(path, record, directory)
+
+    def sample() -> None:
+        try:
+            with subprocess.Popen(compose_argv("bash", "-c", script), cwd=ROOT, text=True,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+                for line in process.stdout:
+                    stamp, _, state = line.strip().partition(" ")
+                    record["samples"].append({"at": datetime.fromtimestamp(float(stamp), timezone.utc).isoformat(),
+                                              "state": state})
+                    _atomic_json(path, record, directory)
+                if process.wait(timeout=30):
+                    record["error"] = process.stderr.read()[-2000:] or f"exit {process.returncode}"
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            record["error"] = f"{type(exc).__name__}: {exc}"
+        record["done"] = True
+        _atomic_json(path, record, directory)
+
+    threading.Thread(target=sample, name=f"timeline-{run_id}-{step_id}", daemon=True).start()
+
+
+def read_timeline(run_id: str, step_id: str) -> dict | None:
+    """The recorded transitions for one step, or None when none were sampled."""
+    path = _timeline_path(run_id, step_id)
+    return _json(path, _run_path(run_id)) if path.exists() else None
+
+
 def cleanup_run(run_id: str) -> dict:
     """Retryable explicit recovery of exact owned IDs/Reasons; preserve all evidence.
 
@@ -932,6 +1063,11 @@ def cleanup_run(run_id: str) -> dict:
                     if command["status"] != "succeeded":
                         errors.append(f"Resume {node_name}: {command.get('error') or command['stderr'] or command['status']}")
                 except (ValueError, OSError) as exc:
+                    errors.append(str(exc))
+            if any(r["effect"] == "accounting" for r in receipts):
+                try:
+                    _cleanup_account(run, owned, commands)
+                except (ValueError, OSError, subprocess.SubprocessError) as exc:
                     errors.append(str(exc))
             report["commands"].extend(commands)
             report.setdefault("cleanup_attempts", []).append({"observed_at": _now(), "commands": commands, "errors": errors})

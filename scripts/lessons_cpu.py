@@ -240,7 +240,7 @@ def get_lesson(chapter):
                       sources=['cpu.sbatch', 'cpu_probe.py'], cases=['cpu-affinity'],
                       verify=lambda d: [case(step, lambda step=step: _identity(d, step, d['parameters']['node'],
                                                                            int(d['parameters']['cpus']))) for step in steps])
-    elif chapter == '03-queue':
+    elif chapter == '04-queue':
         steps = {
             'holder': lab.Step('submit', lambda r: submit(r, 'holder', command=probe('hold', '--release',
                 r['container_dir'] + '/queue.release', '--seconds', '180'),
@@ -249,11 +249,12 @@ def get_lesson(chapter):
                 options=('--nodelist=cpu01',)), _queue_ready),
             'release': lab.Step('local', lambda r: lab.local_argv(r['run_id'], 'release', 'queue.release'), _release_ready),
         }
-        lesson = dict(title='03 資源與排隊', fields={}, labels={'holder': '提交四 CPU holder（180 秒）',
+        lesson = dict(title='04 資源與排隊', fields={}, labels={'holder': '提交四 CPU holder（180 秒）',
                       'waiter': '確認 holder 後提交 waiter', 'release': '保存 PENDING 證據並釋放 holder'},
                       sources=['cpu.sbatch', 'cpu_probe.py'], cases=['resource-queue-release'],
+                      holder_seconds={'holder': 180},
                       verify=lambda d: [case('resource-queue-release', lambda: _queue_verify(d))])
-    elif chapter == '04-csv':
+    elif chapter == '05-csv':
         steps = {
             'prepare': lab.Step('local', lambda r: lab.local_argv(r['run_id'], 'pipeline-prepare', 'pipeline'), _csv_prepare_ready),
             'backup': lab.Step('local', lambda r: lab.local_argv(r['run_id'], 'copy', 'pipeline/input/shard-2.csv', 'pipeline/shard-2.backup.csv'), _csv_backup_ready),
@@ -266,13 +267,14 @@ def get_lesson(chapter):
             'repair-shard': lab.Step('submit', lambda r: _csv_submit(r, 'repair-shard', worker=True, repaired=True), _after('repair-input')),
             'aggregate-repaired': lab.Step('submit', lambda r: _csv_submit(r, 'aggregate-repaired', repaired=True), _after('repair-shard')),
         }
-        lesson = dict(title='04 CSV 資料管線', fields={'mode': ['success', 'failure-recovery']},
+        lesson = dict(title='05 CSV 資料管線', fields={'mode': ['success', 'failure-recovery']},
                       labels={'prepare': '準備四片 CSV', 'backup': '壞輸入：備份 shard 2', 'inject': '壞輸入：注入非數字',
                               'array': '提交 worker array 0–3', 'aggregate': '提交 afterok aggregate',
                               'missing-aggregate': '明確測試缺片 aggregate（無 dependency）', 'cancel-dependent': '保存失敗證據並取消原 dependent',
                               'repair-input': '還原 shard 2 輸入', 'repair-shard': '只重送 shard 2', 'aggregate-repaired': '提交修復後 afterok aggregate'},
                       sources=['pipeline.py', 'pipeline-worker.sbatch', 'pipeline-aggregate.sbatch'],
                       cases=['csv-pipeline-success', 'csv-pipeline-failure-recovery'],
+                      applicable=lambda r: list(steps) if r['parameters']['mode'] == 'failure-recovery' else ['prepare', 'array', 'aggregate'],
                       verify=lambda d: [case('csv-pipeline-' + d['parameters']['mode'], lambda: _csv_verify(d))])
     elif chapter == '05-mpi':
         steps = {'mpi': lab.Step('submit', lambda r: submit(r, 'mpi', script='mpi.sbatch',

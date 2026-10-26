@@ -1,0 +1,74 @@
+# Optional slurmdbd + MariaDB accounting. Enable for every docker compose call
+# (scripts and notebooks included) with a project .env line:
+#   COMPOSE_FILE=compose.yaml:compose.accounting.yaml
+# No ports are published; credentials live only in the accounting-secret volume.
+x-management: &management
+  networks: [cluster]
+  cpuset: '6-7,14-15'
+  cpus: 1
+  stop_grace_period: 30s
+
+services:
+  init:
+    volumes:
+      - accounting-secret:/etc/slurm-accounting
+
+  mariadb:
+    <<: *management
+    image: mariadb:11.4@sha256:250e1609e93c0e6aecf64bfbab2d84d5e89d2481540fe77447ff6c855c3b1873
+    hostname: mariadb
+    mem_limit: 1536m
+    memswap_limit: 1536m
+    environment:
+      MARIADB_DATABASE: slurm_acct_db
+      MARIADB_USER: slurm
+      MARIADB_PASSWORD_FILE: /run/secrets/accounting/db-password
+      MARIADB_ROOT_PASSWORD_FILE: /run/secrets/accounting/db-root-password
+    volumes:
+      - ./config/mariadb-slurm.cnf:/etc/mysql/conf.d/slurm.cnf:ro
+      - accounting-secret:/run/secrets/accounting:ro
+      - accounting-db:/var/lib/mysql
+    healthcheck:
+      test: [CMD, healthcheck.sh, --connect, --innodb_initialized]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 20s
+
+  slurmdbd:
+    <<: *management
+    image: slurm-playground/node:26.05.5
+    hostname: slurmdbd
+    command: [slurmdbd]
+    mem_limit: 512m
+    memswap_limit: 512m
+    volumes:
+      - ./config/slurmdbd.conf:/etc/slurm/slurmdbd.conf.in:ro
+      - munge-key:/etc/munge:ro
+      - accounting-secret:/run/secrets/accounting:ro
+    depends_on:
+      mariadb:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, bash, -c, 'exec 3<>/dev/tcp/127.0.0.1/6819']
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  # Same file on every Slurm node keeps slurm.conf hashes consistent.
+  controller:
+    volumes:
+      - ./config/accounting-slurmdbd.conf:/etc/slurm/accounting.conf:ro
+  cpu01:
+    volumes:
+      - ./config/accounting-slurmdbd.conf:/etc/slurm/accounting.conf:ro
+  cpu02:
+    volumes:
+      - ./config/accounting-slurmdbd.conf:/etc/slurm/accounting.conf:ro
+  gpu01:
+    volumes:
+      - ./config/accounting-slurmdbd.conf:/etc/slurm/accounting.conf:ro
+
+volumes:
+  accounting-secret:
+  accounting-db:

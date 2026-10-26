@@ -5,7 +5,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     systemd systemd-sysv dbus libdbus-1-dev libhwloc-dev hwloc libpam0g-dev \
     libssl-dev libjson-c-dev libhttp-parser-dev libyaml-dev libbpf-dev \
     libpmix-dev openmpi-bin libopenmpi-dev libnuma-dev procps iproute2 \
-    autoconf automake libtool \
+    libmariadb-dev autoconf automake libtool \
     && rm -f /etc/munge/munge.key && rm -rf /var/lib/apt/lists/*
 ARG SLURM_COMMIT=ad46cad8e0969e8e5945b88f0a21f6bed0f9a3bf
 ARG SLURM_SHA256=88d22fc5c88e9d61a2c9855755cd66fc37bb6c82360aec250b19358a935222ba
@@ -13,8 +13,9 @@ RUN curl -fsSL "https://codeload.github.com/SchedMD/slurm/tar.gz/${SLURM_COMMIT}
     && echo "${SLURM_SHA256}  /tmp/slurm.tar.gz" | sha256sum -c - \
     && mkdir /tmp/slurm-src && tar -xzf /tmp/slurm.tar.gz -C /tmp/slurm-src --strip-components=1 \
     && cd /tmp/slurm-src \
-    && ./configure --prefix=/usr/local --sysconfdir=/etc/slurm --with-pmix=/usr/lib/x86_64-linux-gnu/pmix2 --with-hwloc=/usr --with-munge=/usr \
+    && ./configure --prefix=/usr/local --sysconfdir=/etc/slurm --with-pmix=/usr/lib/x86_64-linux-gnu/pmix2 --with-hwloc=/usr --with-munge=/usr --with-mysql_config=/usr/bin \
     && make -j4 && make install && ldconfig \
+    && test -f /usr/local/lib/slurm/accounting_storage_mysql.so \
     && rm -rf /tmp/slurm-src /tmp/slurm.tar.gz
 COPY docker/install-job-runtime.sh /tmp/install-job-runtime.sh
 COPY docker/enroot-nested-ldconfig.patch /tmp/enroot-nested-ldconfig.patch

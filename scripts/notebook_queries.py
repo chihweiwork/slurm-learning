@@ -23,8 +23,13 @@ from slurm_cli import compose_argv, run_command
 ROOT = Path(__file__).resolve().parents[1]
 QUERY_TIMEOUT = 5
 LOG_PREVIEW_BYTES = 64 * 1024
-_SNAPSHOT_LOCK = threading.Lock()
+_SNAPSHOT_GUARD = threading.Lock()
+_IN_FLIGHT = None
 _LAST_SUCCESS = {}
+# History index entries keyed by report path -> (mtime_ns, size, entry): reports reach tens of MB,
+# and re-parsing every one on each 5 s refresh kept the kernel busy for seconds.
+_HISTORY_CACHE = {}
+SNAPSHOT_WAIT_SECONDS = 120
 
 
 def _now():
@@ -271,50 +276,71 @@ def _link_queue(sources):
 def read_snapshot():
     """Sequential, bounded queries plus read-only local history.
 
-    A concurrent refresh returns an explicit busy error, not overlapping Docker
-    work. Source status/errors describe this attempt; stale data and its own
-    last_success_at describe the previous success. None means never observed.
+    Concurrent callers (auto refresh, a manual click, another page) join the
+    refresh already running and receive its result instead of an error, so a
+    duplicate request never degrades the page or overlaps Docker work. Source
+    status/errors describe that attempt; stale data and its own last_success_at
+    describe the previous success. None means never observed.
     """
-    names = ('controller', 'nodes', 'jobs', 'queue', 'gpu')
-    if not _SNAPSHOT_LOCK.acquire(blocking=False):
-        return {'status': 'busy', 'observed_at': _now(),
-                'sources': {name: _cached(name, _skipped('A snapshot refresh is already running'))
-                            for name in names},
-                'history': read_history(),
-                'counts': {'running': None, 'pending': None, 'healthy_nodes': None}}
+    global _IN_FLIGHT
+    with _SNAPSHOT_GUARD:
+        flight = _IN_FLIGHT
+        leader = flight is None
+        if leader:
+            flight = _IN_FLIGHT = {'done': threading.Event(), 'result': None}
+    if not leader:
+        if flight['done'].wait(SNAPSHOT_WAIT_SECONDS) and flight['result'] is not None:
+            return {**deepcopy(flight['result']), 'coalesced': True}
+        return read_snapshot() if flight['done'].is_set() else _busy_snapshot()
     try:
-        sources = {'controller': _cached('controller', query_controller())}
-        scheduler_available = sources['controller']['status'] == 'ok'
-        for name, query in (('nodes', query_nodes), ('jobs', query_jobs), ('queue', query_queue)):
-            result = query() if scheduler_available else _skipped(
-                'A preceding scheduler query failed; dependent query skipped')
-            sources[name] = _cached(name, result)
-            scheduler_available = result['status'] == 'ok'
-        # GPU observations do not depend on slurmctld. Avoid another CLI call
-        # if a preceding command could not complete or Docker is unreachable.
-        transport_error = any(
-            source['returncode'] is None or any(
-                token in source['stderr'].lower()
-                for token in ('cannot connect to the docker daemon', 'is the docker daemon running',
-                              'permission denied while trying to connect'))
-            for source in sources.values() if not source.get('skipped'))
-        sources['gpu'] = _cached('gpu', _skipped('Transport unavailable; GPU query skipped')
-                                if transport_error else query_gpu())
-        _link_queue(sources)
-        queue, nodes = sources['queue'], sources['nodes']
-        counts = {'running': None, 'pending': None, 'healthy_nodes': None}
-        if queue['status'] == 'ok':
-            counts.update(running=sum(row['state'] == 'RUNNING' for row in queue['data']),
-                          pending=sum(row['state'] == 'PENDING' for row in queue['data']))
-        if nodes['status'] == 'ok':
-            unhealthy = {'DOWN', 'DRAIN', 'DRAINED', 'DRAINING', 'FAIL', 'FAILING',
-                         'NO_RESPOND', 'NOT_RESPONDING', 'UNKNOWN', 'INVAL', 'INVALID_REG'}
-            counts['healthy_nodes'] = sum(bool(set(node['state']) & {'IDLE', 'ALLOCATED', 'MIXED'})
-                                          and not set(node['state']) & unhealthy for node in nodes['data'])
-        return {'status': 'ok' if all(source['status'] == 'ok' for source in sources.values()) else 'error',
-                'observed_at': _now(), 'sources': sources, 'history': read_history(), 'counts': counts}
+        flight['result'] = _collect_snapshot()
+        return deepcopy(flight['result'])
     finally:
-        _SNAPSHOT_LOCK.release()
+        with _SNAPSHOT_GUARD:
+            _IN_FLIGHT = None
+        flight['done'].set()
+
+
+def _busy_snapshot():
+    names = ('controller', 'nodes', 'jobs', 'queue', 'gpu')
+    reason = f'A snapshot refresh has run for over {SNAPSHOT_WAIT_SECONDS}s; showing the last success'
+    return {'status': 'busy', 'observed_at': _now(),
+            'sources': {name: _cached(name, _skipped(reason)) for name in names},
+            'history': read_history(),
+            'counts': {'running': None, 'pending': None, 'healthy_nodes': None}}
+
+
+def _collect_snapshot():
+    sources = {'controller': _cached('controller', query_controller())}
+    scheduler_available = sources['controller']['status'] == 'ok'
+    for name, query in (('nodes', query_nodes), ('jobs', query_jobs), ('queue', query_queue)):
+        result = query() if scheduler_available else _skipped(
+            'A preceding scheduler query failed; dependent query skipped')
+        sources[name] = _cached(name, result)
+        scheduler_available = result['status'] == 'ok'
+    # GPU observations do not depend on slurmctld. Avoid another CLI call
+    # if a preceding command could not complete or Docker is unreachable.
+    transport_error = any(
+        source['returncode'] is None or any(
+            token in source['stderr'].lower()
+            for token in ('cannot connect to the docker daemon', 'is the docker daemon running',
+                          'permission denied while trying to connect'))
+        for source in sources.values() if not source.get('skipped'))
+    sources['gpu'] = _cached('gpu', _skipped('Transport unavailable; GPU query skipped')
+                            if transport_error else query_gpu())
+    _link_queue(sources)
+    queue, nodes = sources['queue'], sources['nodes']
+    counts = {'running': None, 'pending': None, 'healthy_nodes': None}
+    if queue['status'] == 'ok':
+        counts.update(running=sum(row['state'] == 'RUNNING' for row in queue['data']),
+                      pending=sum(row['state'] == 'PENDING' for row in queue['data']))
+    if nodes['status'] == 'ok':
+        unhealthy = {'DOWN', 'DRAIN', 'DRAINED', 'DRAINING', 'FAIL', 'FAILING',
+                     'NO_RESPOND', 'NOT_RESPONDING', 'UNKNOWN', 'INVAL', 'INVALID_REG'}
+        counts['healthy_nodes'] = sum(bool(set(node['state']) & {'IDLE', 'ALLOCATED', 'MIXED'})
+                                      and not set(node['state']) & unhealthy for node in nodes['data'])
+    return {'status': 'ok' if all(source['status'] == 'ok' for source in sources.values()) else 'error',
+            'observed_at': _now(), 'sources': sources, 'history': read_history(), 'counts': counts}
 
 
 def _relative_run(run_dir):
@@ -404,6 +430,22 @@ def download_log(run_dir, path):
 
 
 def _history_entry(run_dir, source):
+    path = run_dir / 'report.json'
+    try:
+        info = os.lstat(path)
+        identity = (info.st_mtime_ns, info.st_size) if stat.S_ISREG(info.st_mode) else None
+    except OSError:
+        identity = None
+    cached = _HISTORY_CACHE.get(str(path))
+    if identity is not None and cached is not None and cached[0] == identity:
+        return deepcopy(cached[1])
+    entry = _read_history_entry(run_dir, source)
+    if identity is not None:
+        _HISTORY_CACHE[str(path)] = (identity, deepcopy(entry))
+    return entry
+
+
+def _read_history_entry(run_dir, source):
     entry = {'source': source, 'kind': 'notebook' if source == 'demos' else 'smoke',
              'run_id': run_dir.name, 'path': str(run_dir / 'report.json'),
              'status': 'error', 'report': None, 'error': None}

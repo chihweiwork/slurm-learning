@@ -4,7 +4,7 @@ import time
 
 import notebook_lab as lab
 from lesson_common import (
-    PROBE, Pending, case, exit_failed, job_id, json_lines, probe, receipt, require,
+    PROBE, Pending, case, exit_failed, job_id, json_lines, probe, receipt, records, require,
     state, submit, text, view,
 )
 from notebook_queries import query_nodes
@@ -66,8 +66,14 @@ def _released(data, step, node, cpus):
 
 
 def _pending(data, step='waiter', reasons=None):
+    """Waiting evidence: PENDING now, never requeued, and no workload output yet.
+
+    A PENDING record's StartTime is the backfill scheduler's *expected* start
+    (e.g. behind an exclusive holder), not proof that the job ever ran.
+    """
     rows = state(data, step, 'PENDING')
-    require(all(r.get('start_time') is None for r in rows), f'{step} 曾執行，不能作為等待證據')
+    require(all(r['raw'].get('restart_cnt') == 0 for r in rows),
+            f'{step} 曾被 requeue（restart_cnt>0），不能作為等待證據')
     require(not text(data, step).strip(), f'{step} 等待中卻已有輸出')
     if reasons:
         require(all(r['state_reason'] in reasons for r in rows), f'{step} 非預期的等待原因：{rows}')
@@ -130,6 +136,35 @@ def _oom(data):
     return {'job': rows, 'task': task, 'kernel_events': observations}
 
 
+def _oom_summary(data):
+    """Field-level OOM evidence; full events can exceed the 64 KiB preview."""
+    values = json_lines(text(data, 'offender'))
+    task = next((r for r in values if 'allocation_ceiling_mib' in r), None)
+    after = next((r for r in values if r.get('event') == 'oom_observation'), None)
+    note = ('「前」來自 offender task 開始時讀到的 cgroup（含祖先層），「後」來自 srun 結束後 batch shell 的 '
+            '`oom-events` 觀測；兩者只在共同祖先（job 層）重疊。採用為證據＝該層 `memory.max=134217728`（128 MiB）'
+            '且之後 `oom_kill>0`；`memory.swap.max=0` 表示不能用 swap 逃過限制。路徑省略 '
+            '`/sys/fs/cgroup/system.slice/slurmstepd.scope/` 前綴；完整內容可在下方輸出區下載。')
+    if task is None:
+        return [('OOM 欄位摘要', [], '尚無 offender 的 limits 輸出；job 開始執行後才會出現。')]
+    before = {entry['path']: entry for entry in task.get('limits', [])}
+    later = {entry['path']: entry for entry in (after or {}).get('limits', [])}
+    limit = str(128 * 1024 * 1024)
+    rows = []
+    prefix = '/sys/fs/cgroup/system.slice/slurmstepd.scope/'
+    for path in list(before) + [p for p in later if p not in before]:
+        first, last = before.get(path), later.get(path)
+        entry = last or first
+        rows.append({'採用為證據': '是' if last and last['memory.max'] == limit and last['events'].get('oom_kill', 0) > 0 else '否',
+                     'cgroup': path.replace(prefix, '…/') if path.startswith(prefix) else path,
+                     'memory.max': entry['memory.max'], 'memory.swap.max': entry['memory.swap.max'],
+                     'oom_kill 前': first['events'].get('oom_kill') if first else '（task 未讀到此層）',
+                     'oom_kill 後': last['events'].get('oom_kill') if last else
+                     ('（batch 觀測不含此層）' if after else '尚未觀測')})
+    rows.sort(key=lambda row: row['採用為證據'] != '是')
+    return [('OOM 欄位摘要', rows, note)]
+
+
 def _memory_release(data, snapshot):
     return {'oom': _oom(data), 'neighbor_alive_after_oom': _holder(data, 'neighbor', node='cpu01', cpus=1)}
 
@@ -170,7 +205,9 @@ def _process_check(data, *, gone):
     live = {(r['pid'], str(r['starttime']), r['role']) for r in observed.get('live', [])}
     if gone:
         if result.returncode != 0 or live:
-            raise Pending('等待 Slurm 清除所有相同 PID/starttime 的 live 後代')
+            roles = '、'.join(sorted(role for _, _, role in live)) or '未知'
+            raise Pending(f'正在等 Slurm 清理程序與 cgroup：{roles} 仍以相同 PID/starttime 存活，'
+                          '清乾淨後本步驟會自動解鎖（不要自行 kill）')
     else:
         require(result.returncode == 1 and live == expected, '三代程序尚未同時存活，或工作已過期')
     return {'identities': identities, 'observation': observed, 'argv': command}
@@ -185,7 +222,14 @@ def _cancel_pre(data, snapshot):
 def _lifecycle_reuse(data, snapshot):
     mode = data['parameters']['mode']
     require(mode in {'cancel', 'timeout'}, '無效模式')
-    ended = state(data, 'descendants', 'CANCELLED' if mode == 'cancel' else 'TIMEOUT')
+    target = 'CANCELLED' if mode == 'cancel' else 'TIMEOUT'
+    try:
+        ended = state(data, 'descendants', target)
+    except Pending:
+        rows = records(data, 'descendants')
+        if any('COMPLETING' in row['job_state'] for row in rows):
+            raise Pending(f'正在等 Slurm 終止程序並清理 cgroup（COMPLETING），之後才會變成 {target}')
+        raise
     evidence = {'ended': ended, 'processes_after': _process_check(data, gone=True)}
     if mode == 'cancel':
         evidence['before_cancel'] = _saved(data, 'cancel')
@@ -292,7 +336,7 @@ def _verify_recovery(data):
 
 
 def get_lesson(chapter):
-    if chapter == '08-memory':
+    if chapter == '07-memory':
         steps = {
             'neighbor': lab.Step('submit', lambda r: _hold_submit(r, 'neighbor', 'cpu01', exclusive=False)),
             'offender': lab.Step('submit', lambda r: submit(r, 'offender', options=['--nodelist=cpu01'],
@@ -301,11 +345,12 @@ def get_lesson(chapter):
             'release-neighbor': lab.Step('local', lambda r: _release(r, 'neighbor'), _guard(_memory_release)),
             'reuse': lab.Step('submit', lambda r: _affinity(r, 'reuse', exclusive=True), _guard(_memory_reuse)),
         }
-        lesson = {'title': '08｜記憶體失敗與鄰居隔離', 'fields': {'memory_mib': [128]}, 'steps': steps,
+        lesson = {'title': '07｜記憶體失敗與鄰居隔離', 'fields': {'memory_mib': [128]}, 'steps': steps,
                   'labels': {'neighbor': '1 啟動鄰居 holder（180 秒）', 'offender': '2 執行有界 128 MiB OOM 工作',
                              'release-neighbor': '3 證明 OOM 與鄰居存活，再釋放鄰居', 'reuse': '4 驗證資源重用'},
-                  'verify': _verify_memory, 'cases': ['memory-oom-isolation'], 'holder_seconds': {'neighbor': 180}}
-    elif chapter == '09-lifecycle':
+                  'verify': _verify_memory, 'cases': ['memory-oom-isolation'], 'holder_seconds': {'neighbor': 180},
+                  'summaries': _oom_summary}
+    elif chapter == '07-lifecycle':
         steps = {
             'descendants': lab.Step('submit', lambda r: submit(r, 'descendants',
                 command=probe('descendants', '--marker', f'{r["container_dir"]}/process', '--seconds', 180),
@@ -313,11 +358,13 @@ def get_lesson(chapter):
             'cancel': lab.Step('cancel', lambda r: compose_argv('scancel', job_id(r, 'descendants')), _guard(_cancel_pre)),
             'reuse': lab.Step('submit', lambda r: _affinity(r, 'reuse', exclusive=True), _guard(_lifecycle_reuse)),
         }
-        lesson = {'title': '09｜取消、限時與三代程序清理', 'fields': {'mode': ['cancel', 'timeout']}, 'steps': steps,
+        lesson = {'title': '07｜取消、限時與三代程序清理', 'fields': {'mode': ['timeout', 'cancel']}, 'steps': steps,
                   'labels': {'descendants': '1 啟動三代程序', 'cancel': '2 僅 cancel 模式：確認三代存活後取消',
                              'reuse': '3 確認相同 PID/starttime 已消失並重用四 CPU'},
+                  'applicable': lambda r: ['descendants', 'cancel', 'reuse'] if r['parameters']['mode'] == 'cancel' else ['descendants', 'reuse'],
+                  'timeline': ['descendants'],
                   'verify': _verify_lifecycle, 'cases': ['cancellation-descendant-cleanup', 'time-limit-descendant-cleanup']}
-    elif chapter == '10-drain':
+    elif chapter == '09-drain':
         steps = {
             'holder': lab.Step('submit', lambda r: _hold_submit(r, 'holder', 'cpu02')),
             'drain': lab.Step('drain', lambda r: compose_argv('scontrol', 'update', 'NodeName=cpu02',
@@ -327,13 +374,13 @@ def get_lesson(chapter):
             'resume': lab.Step('resume', lambda r: compose_argv('scontrol', 'update', 'NodeName=cpu02',
                 'State=RESUME', user='root'), _guard(_resume_pre)),
         }
-        lesson = {'title': '10｜DRAIN 排空與 RESUME', 'fields': {'node': ['cpu02']}, 'steps': steps,
+        lesson = {'title': '09｜DRAIN 排空與 RESUME', 'fields': {'node': ['cpu02']}, 'steps': steps,
                   'labels': {'holder': '1 啟動 cpu02 holder（180 秒）', 'drain': '2 DRAIN cpu02',
                              'waiter': '3 提交 waiter', 'release-holder': '4 保存等待證據並釋放 holder',
                              'resume': '5 holder 完成且 waiter 仍等待後 RESUME'},
                   'confirmations': {'drain': 'DRAIN cpu02', 'resume': 'RESUME cpu02'},
                   'verify': _verify_drain, 'cases': ['drain-resume'], 'holder_seconds': {'holder': 180}}
-    elif chapter == '11-recovery':
+    elif chapter == '09-recovery':
         steps = {
             'completed': lab.Step('submit', lambda r: _affinity(r, 'completed', 'cpu02')),
             'holder': lab.Step('submit', lambda r: _hold_submit(r, 'holder', 'cpu01', seconds=240), _guard(_completed_pre)),
@@ -343,11 +390,12 @@ def get_lesson(chapter):
             'release-holder': lab.Step('local', _release, _guard(_recovery_release)),
             'restore': lab.Step('restore-controller', lambda r: ['docker', 'compose', 'up', '-d', '--no-build', 'controller']),
         }
-        lesson = {'title': '11｜Controller 重啟與證據復原', 'fields': {'service': ['controller']}, 'steps': steps,
+        lesson = {'title': '09｜Controller 重啟與證據復原', 'fields': {'service': ['controller']}, 'steps': steps,
                   'labels': {'completed': '1 提交基準工作並等待完成', 'holder': '2 啟動 holder（240 秒）',
                              'waiter': '3 排入 waiter', 'restart': '4 保存證據並重啟 controller',
                              'release-holder': '5 查核狀態保存後釋放 holder', 'restore': '故障復原：啟動 controller'},
                   'confirmations': {'restart': 'RESTART controller', 'restore': 'RESTORE controller'},
+                  'optional': {'restore'},
                   'verify': _verify_recovery, 'cases': ['controller-restart-persistence'], 'holder_seconds': {'holder': 240}}
     else:
         raise ValueError(f'Unknown lifecycle chapter: {chapter}')

@@ -11,6 +11,7 @@ x-common: &common
     - ./config/cgroup.conf:/etc/slurm/cgroup.conf:ro
     - ./config/gres.conf:/etc/slurm/gres.conf:ro
     - ./config/plugstack.conf:/etc/slurm/plugstack.conf:ro
+    - ./config/accounting-off.conf:/etc/slurm/accounting.conf:ro
     - munge-key:/etc/munge:ro
     - ./shared:/shared
     - ./examples:/opt/lab/examples:ro
@@ -22,7 +23,9 @@ x-compute: &compute
   <<: *common
   command: [compute]
   cgroup: private
-  cap_add: [SYS_ADMIN, BPF, SYS_RESOURCE, SYS_NICE]
+  # SYS_PTRACE: slurmstepd (root) reads tasks' /proc/<pid>/io; without it Slurm drops
+  # every accounting sample, leaving sstat/sacct MaxRSS and AveCPU empty.
+  cap_add: [SYS_ADMIN, BPF, SYS_RESOURCE, SYS_NICE, SYS_PTRACE]
   security_opt:
     - apparmor=unconfined
     - seccomp=unconfined
@@ -62,6 +65,7 @@ services:
     volumes:
       - ./config/slurm.conf:/etc/slurm/slurm.conf:ro
       - ./config/plugstack.conf:/etc/slurm/plugstack.conf:ro
+      - ./config/accounting-off.conf:/etc/slurm/accounting.conf:ro
       - munge-key:/etc/munge:ro
       - ./shared:/shared
       - ./examples:/opt/lab/examples:ro

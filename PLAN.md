@@ -81,7 +81,7 @@
 - 不掛載 Docker socket，不使用 host PID／network 作為預設，不將主機整棵 cgroup 樹以可寫方式交給容器。
 - 不以全面 `privileged` 或關閉 Slurm 隔離作為方便啟動的預設解法。
 - 若需主機 systemd 委派設定、額外 capability 或權限變更，先列出最小需求、影響與回復方式，取得使用者同意再實施。
-- 使用者已核准本專案計算容器所需的額外 capabilities 與 seccomp／AppArmor 放寬；實作使用 `SYS_ADMIN`、`BPF`、`SYS_RESOURCE`、`SYS_NICE`。仍禁止全面 privileged、Docker socket 與主機整棵可寫 cgroup 掛載，不變更既有服務。
+- 使用者已核准本專案計算容器所需的額外 capabilities 與 seccomp／AppArmor 放寬；實作使用 `SYS_ADMIN`、`BPF`、`SYS_RESOURCE`、`SYS_NICE`、`SYS_PTRACE`。`SYS_PTRACE` 於處理第 1 輪學員回饋時另行核准：slurmstepd 取樣 MaxRSS／AveCPU 需讀取 `/proc/<pid>/io`，缺少時 EACCES 導致全部 jobacct 取樣被捨棄。仍禁止全面 privileged、Docker socket 與主機整棵可寫 cgroup 掛載，不變更既有服務。
 - 所有網路、volume、容器與 runtime 檔案具專案識別；停止／刪除流程僅作用於本專案，不執行全域 prune。
 
 ### cgroup v2 是前置驗證關卡
@@ -197,12 +197,20 @@
 - `examples/`：CPU、array、dependency、MPI、GPU 工作及受控隔離驗證所需程式。
 - `.gitignore`：排除金鑰、runtime 狀態、作業輸出與其他本機產物。
 - `README.md`：操作、限制、權限需求、故障排除、保留資料及明確重設流程。
+- `notebooks/`：marimo Gallery 課程 `00_start.py`、`01_architecture.py`、`02_basic_usage.py`、`03_sbatch_resources.py`、`04_scheduling.py`、`05_parallel.py`、`06_gpu_containers.py`、`07_troubleshooting.py`、`08_accounting.py`、`09_operations.py`、`10_capstone.py`（每章：章首、動畫概念、按鈕示範、迷你終端練習＋檢查、小測驗、收尾）。共用 helpers 位於 `scripts/`：`course_ui.py`（頁面元件）、`course_runner.py`（示範 run 背景執行）、`course_terminal.py`（白名單迷你終端）、`course_progress.py`（`shared/course/<代碼>/` 學習紀錄）、`course_diagrams.py`、`course_sim.py`、`course_tasks.py`、`course_questions.py`、`closing.py`（唯讀收尾清單）。逐章驗收：`marimo run notebooks/` 後以瀏覽器依序走 00–10，每章至少執行示範按鈕、終端任務「檢查」、小測驗與收尾清理。
+- `tests/`：不經瀏覽器的單元回歸測試與實際擷取的 fixtures，以 `uv run --locked python -m unittest discover -s tests` 執行。
 
 實作另外包含 `docker/job.Dockerfile`、`scripts/prepare-job-image.py`、Pyxis／Enroot 設定與 `scripts/gpu_smoke.py`。完整驗收入口為 `python3 scripts/smoke.py`。Docker rootfs 匯出不保留 ENV／CMD／ENTRYPOINT，因此範例提交腳本明確指定命令與環境；runtime 是 Enroot，不冒稱為 Slurm 直接管理 Docker Engine 容器。
+
+選配 accounting 另含 `compose.accounting.yaml`、`config/accounting-{off,slurmdbd}.conf`、`config/slurmdbd.conf`、`config/mariadb-slurm.cnf` 與 `scripts/accounting-init.sh`。
 
 ## 8. 選配擴充：slurmdbd＋MariaDB
 
 啟用時機：核心叢集完成，且需要持久化作業歷史、帳戶／QOS 政策或 fair-share 實驗。
+
+狀態：已實作並實測（2026-10-24）；預設關閉，以 `.env` 的 `COMPOSE_FILE` 啟用，操作見 `README.md`。未啟用任何 enforcement／QOS／fair-share 政策；版本升級程序只有文件，未實際執行。
+
+Gallery 第 08 章（`notebooks/08_accounting.py`）提供 `sacct` 歷史查詢、白名單迷你終端的 `sacct`／`sacctmgr show` 練習與本次專屬 account 的新增／提交／核對／刪除示範；MaxRSS 需要計算節點具 `SYS_PTRACE`（已加入），只有加入後提交的工作有 MaxRSS。
 
 設計：
 

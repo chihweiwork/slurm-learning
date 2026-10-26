@@ -3,14 +3,16 @@
 
 Agreed test seams: docker compose CLI, non-root Slurm submission/query CLI,
 actual job stdout and task-observed affinity/cgroups, and root lifecycle CLI.
-There are no mocked schedulers, source-text checks, or accounting dependencies.
+There are no mocked schedulers or source-text checks. Only the opt-in
+accounting section needs slurmdbd (compose.accounting.yaml); core/gpu never do.
 Run only against this project while its lab nodes are otherwise idle. Every
 created job is tracked; cleanup never cancels jobs belonging to another run.
 
 List scenarios without touching Docker or results with --list-cases. Repeat
 --case NAME to select scenarios (nodes-partitions always runs first), or use
---section core/gpu. Selection cannot be combined with --skip-lifecycle.
-Reports identify full-suite, selected-case, section, and skipped-suite runs.
+--section core/gpu/accounting. Selection cannot be combined with --skip-lifecycle.
+Reports identify full-suite, selected-case, section, and skipped-suite runs; the
+full suite is core+gpu, and accounting runs only when selected explicitly.
 """
 import argparse
 from collections.abc import Callable
@@ -69,6 +71,7 @@ class Smoke:
         self.outputs = {}
         self.output_templates = {}
         self.drained = set()
+        self.accounts = set()
         self.report = {"run_id": self.run_id, "started": datetime.now(timezone.utc).isoformat(),
                        "status": "running", "cases": [], "commands": [], "created_job_ids": [],
                        "cleanup_errors": [], "job_ownership": {}, "submissions": []}
@@ -203,6 +206,33 @@ class Smoke:
         if "DRAIN" in current.get("State", ""):
             self.compose("scontrol", "update", f"NodeName={node}", "State=RESUME", user="root", timeout=20)
         self.drained.remove(node)
+
+    def sacct(self, job_id):
+        keys = ("job_id", "name", "user", "account", "state", "exit_code", "work_dir", "cluster")
+        result = self.compose("sacct", "--noheader", "--parsable2", "--allocations", f"--jobs={job_id}",
+                              "--format=JobID,JobName,User,Account,State,ExitCode,WorkDir,Cluster",
+                              check=False, timeout=15)
+        if result.returncode:
+            return None
+        return [dict(zip(keys, line.split("|"))) for line in result.stdout.splitlines() if line]
+
+    def associations(self, account):
+        return self.compose("sacctmgr", "--noheader", "--parsable2", "show", "associations",
+                            "where", f"account={account}", "format=Cluster,Account,User",
+                            timeout=15).stdout.splitlines()
+
+    def delete_owned_account(self, account):
+        require(account in self.accounts, f"No owned account {account}")
+        for args in (("user", "lab", "where", f"account={account}"), ("account", account)):
+            result = self.compose("sacctmgr", "-i", "delete", *args, user="root", check=False, timeout=30)
+            require(not result.returncode or "Nothing deleted" in result.stdout + result.stderr,
+                    f"sacctmgr delete {shlex.join(args)}: {result.stdout}{result.stderr}")
+        self.accounts.remove(account)
+
+    def container_started(self, *services):
+        return {service: self.command(["docker", "inspect", "--format", "{{.State.StartedAt}}",
+                                       self.command(["docker", "compose", "ps", "-q", service]).stdout.strip()]
+                                      ).stdout.strip() for service in services}
 
     def job(self, job_id):
         result = self.compose("scontrol", "show", "job", "-o", str(job_id))
@@ -493,6 +523,43 @@ class Smoke:
                 "queued_before": pending, "queued_completed": queued_result, "preserved_completed_job": completed,
                 "nodes": reconnected}
 
+    def accounting(self):
+        config = self.compose("scontrol", "show", "config").stdout
+        storage = re.search(r"^AccountingStorageType\s*=\s*(\S+)", config, re.MULTILINE)
+        require(storage and storage.group(1) == "accounting_storage/slurmdbd",
+                "Accounting is not enabled: set COMPOSE_FILE=compose.yaml:compose.accounting.yaml "
+                "in .env and run scripts/up.sh")
+        account = f"smoke-{self.run_id.rsplit('-', 1)[1]}"
+        require(not self.associations(account), f"Account {account} already exists; refusing to adopt it")
+        self.accounts.add(account)
+        self.report["created_accounts"] = sorted(self.accounts)
+        self.save()
+        self.compose("sacctmgr", "-i", "add", "account", account, f"Description=smoke {self.run_id}",
+                     "Organization=lab", user="root", timeout=30)
+        self.compose("sacctmgr", "-i", "add", "user", "lab", f"Account={account}", user="root", timeout=30)
+        added = self.associations(account)
+        require(sorted(added) == sorted([f"compose-lab|{account}|", f"compose-lab|{account}|lab"]),
+                f"Unexpected associations for {account}: {added}")
+        job_id = self.submit("accounting", self.probe("affinity"), (f"--account={account}",))
+        self.finish(job_id)
+        expected = [{"job_id": job_id, "name": f"smoke-{self.run_id}-accounting", "user": "lab",
+                     "account": account, "state": "COMPLETED", "exit_code": "0:0",
+                     "work_dir": self.run_dir, "cluster": "compose-lab"}]
+        def recorded():
+            return self.sacct(job_id) == expected
+        self.wait_until(f"sacct records job {job_id}", recorded, timeout=60)
+        before = self.container_started("mariadb", "slurmdbd")
+        self.command(["docker", "compose", "restart", "mariadb", "slurmdbd"], timeout=120)
+        after = self.container_started("mariadb", "slurmdbd")
+        require(all(after[name] != before[name] for name in before), f"Services did not restart: {before} -> {after}")
+        self.wait_until(f"sacct still returns job {job_id} after restart", recorded, timeout=120)
+        require(sorted(self.associations(account)) == sorted(added), "Associations changed across restart")
+        self.delete_owned_account(account)
+        remaining = self.associations(account)
+        require(not remaining, f"Associations left after delete: {remaining}")
+        return {"account": account, "associations": added, "sacct": expected,
+                "restarted": {"before": before, "after": after}, "associations_after_delete": remaining}
+
     def failure_evidence(self):
         evidence = {}
         for args in (("sinfo", "-Nel"), ("squeue", "--all", "--long"), ("scontrol", "show", "nodes", "-o")):
@@ -555,6 +622,11 @@ class Smoke:
                 self.wait_until("all smoke jobs leave the active queue", jobs_gone, timeout=45)
             except Exception as exc:
                 self.report["cleanup_errors"].append(str(exc))
+        for account in sorted(self.accounts.copy()):
+            try:
+                self.delete_owned_account(account)
+            except Exception as exc:
+                self.report["cleanup_errors"].append(f"delete account {account}: {exc}")
         self.report["created_job_ids"] = sorted(self.jobs, key=int)
         unknown = [attempt for attempt in self.report["submissions"] if attempt["status"] == "unknown"]
         if unknown:
@@ -587,6 +659,7 @@ def case_catalog(smoke=None):
         Case("csv-pipeline-success", "core", False, partial(csv_pipeline_success, smoke)),
         Case("csv-pipeline-failure-recovery", "core", False, partial(csv_pipeline_failure_recovery, smoke)),
         *(Case(name, "gpu", False, callback) for name, callback in gpu_cases(smoke)),
+        Case("accounting-sacct-persistence", "accounting", True, partial(Smoke.accounting, smoke)),
     ]
 
 
@@ -595,9 +668,10 @@ def main():
     parser.add_argument("--list-cases", action="store_true", help="List case names without Docker or filesystem side effects")
     parser.add_argument("--case", action="append", dest="cases", metavar="NAME",
                         help="Select a case; repeat to select more (inventory always runs first)")
-    parser.add_argument("--skip-lifecycle", action="store_true", help="Skip drain/resume and controller restart; not a full-suite pass")
-    parser.add_argument("--section", choices=("core", "gpu", "all"), default=None,
-                        help="Select real acceptance scenarios; default includes independent-image GPU jobs")
+    parser.add_argument("--skip-lifecycle", action="store_true",
+                        help="Skip maintenance cases (drain/resume, controller or accounting restarts); not a full-suite pass")
+    parser.add_argument("--section", choices=("core", "gpu", "accounting", "all"), default=None,
+                        help="Select real acceptance scenarios; all = core+gpu (accounting is opt-in)")
     args = parser.parse_args()
     catalog = case_catalog()
     names = {case.name for case in catalog}
@@ -619,10 +693,10 @@ def main():
     selected = [case for case in catalog
                 if case.name == "nodes-partitions"
                 or (case.name in requested if args.cases is not None
-                    else section == "all" or case.section == section)]
+                    else case.section == section or (section == "all" and case.section != "accounting"))]
     selected_names = {case.name for case in selected}
     skipped = {case.name for case in selected if args.skip_lifecycle and case.maintenance}
-    full_suite = selected_names == names and not skipped
+    full_suite = selected_names == {case.name for case in catalog if case.section != "accounting"} and not skipped
     scope = ("case-selection" if args.cases is not None else
              "section" if section != "all" else
              "partial-suite" if skipped else "full-suite")

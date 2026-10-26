@@ -177,7 +177,7 @@ def get_lesson(chapter):
         title = '06｜獨立容器與真實 CUDA 計算'
         verify = _verify_compute
         cases = ['gpu_direct_cuda_numerical', 'gpu_independent_oci_cuda_numerical']
-    elif chapter == '07-gpu-isolation':
+    elif chapter == '06-gpu-isolation':
         steps = {
             'deny-direct': lab.Step('submit', lambda run: submit(
                 run, 'deny-direct', command=denied_command(False),
@@ -204,13 +204,16 @@ def get_lesson(chapter):
                   'holder': '5. 提交 GPU 容器 holder（120 秒）',
                   'waiter': '6. GPU_HELD 後提交第二個 GPU job',
                   'cancel-holder': '7. waiter PENDING 後取消本次 holder'}
-        title = '07｜GPU 裝置隔離、排隊與取消'
+        title = '06｜GPU 裝置隔離、排隊與取消'
         verify = _verify_isolation
         cases = ['gpu_no_gres_direct_denied', 'gpu_no_gres_container_denied',
                  'cpu_nodes_no_gpu_device', 'gpu_container_queue_cancel_release']
     else:
         raise ValueError('Unknown GPU lesson: ' + chapter)
     lab.register_chapter(chapter, steps, verify=verify)
-    return {'chapter': chapter, 'title': title, 'fields': {'node': ['gpu01']},
-            'steps': steps, 'labels': labels, 'verify': verify, 'cases': cases,
-            'sources': ['gpu_compute.py', 'container-gpu.sbatch']}
+    lesson = {'chapter': chapter, 'title': title, 'fields': {'node': ['gpu01']},
+              'steps': steps, 'labels': labels, 'verify': verify, 'cases': cases,
+              'sources': ['gpu_compute.py', 'container-gpu.sbatch']}
+    if chapter == '06-gpu-isolation':
+        lesson.update(holder_seconds={'holder': 120}, markers={'holder': 'GPU_HELD'})
+    return lesson
